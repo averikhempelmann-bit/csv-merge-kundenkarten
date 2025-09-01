@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Merge CSVs by Kundennummer (Nr. ↔ Deb.-Nr.)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; line-height: 1.4; }
+    fieldset { border: 1px solid #999; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    legend { font-weight: 600; }
+    label { display:block; margin: .5rem 0 .25rem; }
+    input[type=file], select, button { padding: .5rem; font-size: 1rem; }
+    .row { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); align-items: end; }
+    #log { white-space: pre-wrap; background: #f6f6f6; border-radius: 6px; padding: .75rem; max-height: 280px; overflow:auto; }
+    .muted { color: #666; font-size: .95rem; }
+    .ok { color: #0a7; }
+    .warn { color: #b80; }
+    .err { color: #c22; }
+  </style>
+</head>
+<body>
+  <h1>Combine two CSVs on Kundennummer and export Kundennummer;E-Mail</h1>
+  <p class="muted">Inputs are semicolon-delimited CSVs. File A must contain <b>Nr.</b> and <b>E-Mail</b>. File B must contain <b>Deb.-Nr.</b> (and usually <b>Kartennummer</b>).</p>
+
+  <fieldset>
+    <legend>1) Upload files</legend>
+    <div class="row">
+      <div>
+        <label for="fileA">File A (E-Mail list):</label>
+        <input type="file" id="fileA" accept=".csv,text/csv" />
+        <div class="muted">Expected headers: <code>Nr.</code>, <code>E-Mail</code></div>
+      </div>
+      <div>
+        <label for="fileB">File B (Kartennummer list):</label>
+        <input type="file" id="fileB" accept=".csv,text/csv" />
+        <div class="muted">Expected headers: <code>Deb.-Nr.</code> (and <code>Kartennummer</code>)</div>
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>2) Options</legend>
+    <div class="row">
+      <div>
+        <label for="encoding">Encoding</label>
+        <select id="encoding">
+          <option value="auto" selected>Auto (try UTF‑8, else Windows‑1252)</option>
+          <option value="utf-8">UTF‑8</option>
+          <option value="windows-1252">Windows‑1252</option>
+          <option value="iso-8859-1">ISO‑8859‑1</option>
+        </select>
+      </div>
+      <div>
+        <label for="joinType">Join type</label>
+        <select id="joinType">
+          <option value="inner" selected>Inner (only numbers present in both files)</option>
+          <option value="left">Left (all numbers from File A)</option>
+        </select>
+      </div>
+      <div>
+        <label for="requireEmail">E-Mail requirement</label>
+        <select id="requireEmail">
+          <option value="nonempty" selected>Only include rows with non-empty E-Mail</option>
+          <option value="any">Include even if E-Mail is empty</option>
+        </select>
+      </div>
+    </div>
+  </fieldset>
+
+  <div class="row">
+    <button id="runBtn">Merge & Download CSV</button>
+    <a id="downloadLink" style="display:none;">Download result</a>
+  </div>
+
+  <h3>Log</h3>
+  <pre id="log"></pre>
+
+  <script>
+    const logEl = document.getElementById('log');
+    const btn = document.getElementById('runBtn');
+    const dl = document.getElementById('downloadLink');
+
+    function log(msg, cls = '') {
+      const line = document.createElement('div');
+      if (cls) line.className = cls;
+      line.textContent = msg;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function clearLog(){ logEl.textContent=''; }
+
+    // --- Robust CSV parser (RFC 4180-ish) with configurable delimiter ---
+    function parseCSV(text, delimiter = ';') {
+      const rows = [];
+      const headers = [];
+      let cur = '';
+      let row = [];
+      let inQuotes = false;
+      let i = 0;
+      const len = text.length;
+
+      function pushCell() { row.push(cur); cur = ''; }
+      function pushRow() {
+        // Trim possible \r at end of last cell
+        if (row.length === 0 && cur === '') return; // skip empty last line
+        pushCell();
+        rows.push(row);
+        row = [];
+      }
+
+      while (i < len) {
+        const ch = text[i];
+
+        if (inQuotes) {
+          if (ch === '"') {
+            if (i + 1 < len && text[i + 1] === '"') {
+              // Escaped quote
+              cur += '"';
+              i += 2;
+            } else {
+              inQuotes = false;
+              i++;
+            }
+          } else {
+            cur += ch;
+            i++;
+          }
+        } else {
+          if (ch === '"') {
+            inQuotes = true;
+            i++;
+          } else if (ch === delimiter) {
+            pushCell();
+            i++;
+          } else if (ch === '\n') {
+            pushRow();
+            i++;
+          } else if (ch === '\r') {
+            // Handle \r\n or standalone \r
+            if (i + 1 < len && text[i + 1] === '\n') i++;
+            pushRow();
+            i++;
+          } else {
+            cur += ch;
+            i++;
+          }
+        }
+      }
+      // Flush last cell/row
+      if (cur.length > 0 || row.length > 0) pushRow();
+
+      if (rows.length === 0) return { headers: [], rows: [] };
+      const hdr = rows.shift().map(h => h.trim());
+      return { headers: hdr, rows };
+    }
+
+    // CSV builder with proper quoting for ;, quotes, and newlines
+    function toCSV(rows, delimiter = ';') {
+      const needQuote = (s) => s.includes('"') || s.includes('\n') || s.includes('\r') || s.includes(delimiter);
+      return rows.map(r => r.map(cell => {
+        const s = String(cell ?? '');
+        return needQuote(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      }).join(delimiter)).join('\r\n');
+    }
+
+    // Read file as text with encoding control
+    async function readTextWithEncoding(file, pref = 'auto') {
+      const buf = await file.arrayBuffer();
+      const u8 = new Uint8Array(buf);
+
+      // BOM detection for UTF-8
+      const hasUTF8BOM = u8.length >= 3 && u8[0] === 0xEF && u8[1] === 0xBB && u8[2] === 0xBF;
+
+      function decode(enc) {
+        try { return new TextDecoder(enc, { fatal: false }).decode(u8); }
+        catch { return null; }
+      }
+
+      if (pref === 'utf-8') return decode('utf-8');
+      if (pref === 'windows-1252') return decode('windows-1252');
+      if (pref === 'iso-8859-1') return decode('iso-8859-1');
+
+      // auto
+      let t = decode('utf-8');
+      // Heuristic: if replacement char appears a lot and no BOM, try 1252
+      const replCount = (t.match(/\uFFFD/g) || []).length;
+      if (!hasUTF8BOM && replCount > 0) {
+        const alt = decode('windows-1252');
+        // Prefer the one with fewer replacement chars
+        const altRepl = (alt.match(/\uFFFD/g) || []).length;
+        if (alt && altRepl < replCount) return alt;
+      }
+      return t;
+    }
+
+    function indexOfHeader(headers, nameCandidates) {
+      // returns index of the first matching header (exact, trimmed), or -1
+      const map = new Map(headers.map((h, i) => [h.trim(), i]));
+      for (const n of nameCandidates) {
+        if (map.has(n)) return map.get(n);
+      }
+      return -1;
+    }
+
+    function normalizeKey(s) {
+      return (s ?? '').trim();
+    }
+
+    btn.addEventListener('click', async () => {
+      clearLog();
+      dl.style.display = 'none';
+      dl.removeAttribute('href');
+      dl.removeAttribute('download');
+
+      const fileA = document.getElementById('fileA').files[0];
+      const fileB = document.getElementById('fileB').files[0];
+      const encoding = document.getElementById('encoding').value;
+      const joinType = document.getElementById('joinType').value; // inner|left
+      const requireEmail = document.getElementById('requireEmail').value; // nonempty|any
+
+      if (!fileA || !fileB) {
+        log('Please select both files.', 'err');
+        return;
+      }
+
+      log(`Reading files (${encoding})...`);
+      const [textA, textB] = await Promise.all([
+        readTextWithEncoding(fileA, encoding),
+        readTextWithEncoding(fileB, encoding)
+      ]);
+
+      log('Parsing CSV A (E-Mail file)...');
+      const parsedA = parseCSV(textA, ';');
+      log(`A: ${parsedA.rows.length} data rows, ${parsedA.headers.length} columns.`);
+
+      log('Parsing CSV B (Kartennummer file)...');
+      const parsedB = parseCSV(textB, ';');
+      log(`B: ${parsedB.rows.length} data rows, ${parsedB.headers.length} columns.`);
+
+      // Locate required headers
+      const idxNr = indexOfHeader(parsedA.headers, ['Nr.']);
+      const idxEmail = indexOfHeader(parsedA.headers, ['E-Mail']);
+      const idxDebNr = indexOfHeader(parsedB.headers, ['Deb.-Nr.']);
+
+      if (idxNr < 0) { log('Header "Nr." not found in File A.', 'err'); return; }
+      if (idxEmail < 0) { log('Header "E-Mail" not found in File A.', 'err'); return; }
+      if (idxDebNr < 0) { log('Header "Deb.-Nr." not found in File B.', 'err'); return; }
+
+      // Build maps/sets
+      const emailByNr = new Map(); // Kundennummer -> E-Mail (last non-empty wins)
+      let emptyEmailCount = 0;
+      for (const r of parsedA.rows) {
+        const nr = normalizeKey(r[idxNr]);
+        const mail = String(r[idxEmail] ?? '').trim();
+        if (!nr) continue;
+        if (mail) {
+          emailByNr.set(nr, mail);
+        } else {
+          // Keep track of empties; optionally we can still store empty if requireEmail==='any'
+          if (requireEmail === 'any' && !emailByNr.has(nr)) emailByNr.set(nr, '');
+          emptyEmailCount++;
+        }
+      }
+      log(`Indexed ${emailByNr.size} Kundennummer → E-Mail from A (${emptyEmailCount} rows with empty E-Mail).`, 'ok');
+
+      const setDebNr = new Set(); // Deb.-Nr. present in B
+      for (const r of parsedB.rows) {
+        const dn = normalizeKey(r[idxDebNr]);
+        if (dn) setDebNr.add(dn);
+      }
+      log(`Indexed ${setDebNr.size} distinct Deb.-Nr. from B.`, 'ok');
+
+      // Join
+      const outRows = [];
+      let kept = 0, skipped = 0;
+      for (const [nr, email] of emailByNr.entries()) {
+        const inB = setDebNr.has(nr);
+        const emailOK = (requireEmail === 'any') ? true : (email && email.length > 0);
+
+        if ((joinType === 'inner' && inB) || (joinType === 'left')) {
+          if (emailOK) {
+            outRows.push([nr, email]);
+            kept++;
+          } else {
+            skipped++;
+          }
+        } else {
+          skipped++;
+        }
+      }
+
+      // Sort by Kundennummer (optional; comment out to keep insertion order)
+      outRows.sort((a, b) => a[0].localeCompare(b[0], 'de', { numeric: true, sensitivity: 'base' }));
+
+      log(`Result rows: ${kept} (skipped: ${skipped}).`, kept > 0 ? 'ok' : 'warn');
+
+      // Build CSV
+      const header = ['Kundennummer', 'E-Mail'];
+      const csv = toCSV([header, ...outRows], ';');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      dl.href = url;
+      dl.download = 'kundennummer_email.csv';
+      dl.textContent = 'Download kundennummer_email.csv';
+      dl.style.display = 'inline-block';
+      log('Ready. Click "Download" to save the merged CSV.', 'ok');
+    });
+  </script>
+</body>
+</html>
